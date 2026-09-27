@@ -8,6 +8,10 @@ Untuk tahap awal, teknologi observability yang dipilih adalah **OpenTelemetry (O
 
 Scope implementasi tahap awal: **backend service** (Spring Boot microservice yang saling berkomunikasi lewat HTTP/RestClient). Komponen di luar itu (API Gateway, message broker, web frontend, multi-site topology) didokumentasikan sebagai catatan di bagian akhir, belum masuk scope implementasi.
 
+**Tujuan utama saat ini: trace request, khususnya saat terjadi error.** Yang ingin dicapai adalah kemampuan membuka satu request tertentu (via `traceId`) dan melihat di service mana request itu gagal, beserta stack trace-nya, langsung dari web Jaeger — tanpa perlu login ke server/pod satu per satu.
+
+Log terstruktur ke backend terpisah (Loki/Elastic) dan dashboard metrics **belum jadi prioritas** — ditunda ke Phase 2/4 (lihat bagian 10). Exception yang terjadi tetap terekam otomatis di dalam span sebagai stack trace (bagian 7.5), jadi kebutuhan "lihat kenapa request gagal" sudah terjawab tanpa perlu log pipeline terpisah dulu.
+
 ---
 
 # 1. Apa itu Observability?
@@ -259,6 +263,8 @@ Scope tahap awal: beberapa Spring Boot microservice yang saling memanggil lewat 
 
 Aplikasi mengirim OTLP (traces, metrics, logs) ke OTel Collector, Collector meneruskan ke backend masing-masing.
 
+> **Fokus Phase 1:** jalur **Traces → Jaeger** saja yang aktif dipakai. Jalur Metrics → Prometheus tetap jalan otomatis (tidak perlu setup tambahan) tapi belum dipakai. Jalur Logs → Loki/Elastic **belum diaktifkan** — lihat bagian "Tujuan" dan bagian 10.
+
 ## 5.2 Flow request antar service
 
 ```text
@@ -422,26 +428,50 @@ public void processOrder(Order order) {
 
 Gunakan ini hanya untuk logic yang butuh telemetry spesifik — jangan buat span manual untuk setiap method kecil (lihat bagian 9.3).
 
+## 7.5 Exception otomatis muncul sebagai stack trace di span
+
+Ini yang langsung memenuhi tujuan utama dokumen ini (lihat bagian "Tujuan"). Kalau exception **propagate keluar** dari operasi yang sudah ter-instrument (HTTP request masuk, RestClient call keluar), Micrometer/OTel **otomatis**:
+
+- Set status span jadi `ERROR`.
+- Attach exception sebagai span event berisi `exception.type`, `exception.message`, dan `exception.stacktrace` lengkap.
+
+Tidak perlu kode tambahan. Di Jaeger UI, span yang error ditandai warna merah, dan detail stack trace-nya ada di bagian "Logs" pada span tersebut (lihat bagian 12 untuk cara akses Jaeger UI).
+
+**Batasan:** ini hanya jalan kalau exception benar-benar dilempar (propagate). Kalau exception di-catch dan hanya di-log tanpa dilempar ulang (misal ada fallback logic), span dianggap selesai normal — exception-nya **tidak otomatis** muncul di trace. Untuk kasus ini, rekam manual:
+
+```java
+try {
+    restClient.get().uri("http://payment-service/api/charge").retrieve().body(Void.class);
+} catch (Exception e) {
+    Span.current().recordException(e);   // exception tetap kelihatan di trace meski di-catch
+    // fallback logic di sini
+}
+```
+
 ---
 
 # 8. Strategi Sampling
 
 Yang di-sample adalah **trace**, bukan log. Log diatur lewat level + filter (bagian 2.1), trace diatur lewat sampling.
 
-## 8.1 Head-based sampling (di aplikasi)
+## 8.1 Head-based sampling (di aplikasi) — tidak cocok untuk tujuan saat ini
 
-Keputusan sample diambil di awal request, sebelum tahu hasilnya error atau tidak. Cocok untuk mulai cepat, tapi berisiko request yang justru bermasalah malah tidak ter-sample.
+Keputusan sample diambil di awal request, sebelum tahu hasilnya error atau tidak. **Tidak direkomendasikan** untuk tujuan dokumen ini (trace saat error) — ada risiko nyata request yang justru error malah tidak ter-sample, sehingga tidak muncul di Jaeger saat dibutuhkan.
 
 ```yaml
 management:
   tracing:
     sampling:
-      probability: 0.1   # 10% request di-trace penuh
+      probability: 1.0   # untuk sementara: trace semua request dulu, lihat bagian 8.2
 ```
 
-## 8.2 Tail-based sampling (di OTel Collector) — direkomendasikan untuk production
+Dipakai untuk sementara dengan `probability: 1.0` (semua di-trace) selama volume trafik masih kecil dan tail-based sampling di Collector belum aktif — supaya tidak ada trace error yang terlewat sejak awal.
+
+## 8.2 Tail-based sampling (di OTel Collector) — wajib untuk tujuan "trace saat error"
 
 Semua request tetap menghasilkan span di aplikasi, tapi keputusan simpan/buang diambil di Collector setelah trace lengkap terkumpul — sehingga request yang **error atau lambat selalu tersimpan**, sisanya (trace normal) disampling kecil.
+
+Karena tujuan utama saat ini adalah memastikan **semua trace error bisa diakses**, `errors-policy` di bawah ini adalah bagian paling penting dari config ini — pastikan policy ini aktif sebelum mengecilkan sampling rate baseline.
 
 ```yaml
 processors:
@@ -505,7 +535,7 @@ Tujuannya: telemetry yang cukup untuk **Detect → Investigate → Understand �
 
 # 10. Roadmap Implementasi
 
-## Phase 1 — Basic (scope dokumen ini)
+## Phase 1 — Trace & error visibility (fokus dokumen ini)
 
 ```text
 Setiap Spring Boot service
@@ -513,22 +543,23 @@ Setiap Spring Boot service
     +-- Micrometer Tracing + OTel bridge
           |
           +-- Traces (RestClient antar service otomatis ter-propagate)
-          +-- Metrics (HTTP, JVM)
-          +-- Logs (level INFO, filter WARN+ di Collector)
+          +-- Exception otomatis jadi stack trace di span (bagian 7.5)
 ```
 
 Target:
-- Setiap service menghasilkan telemetry dan bisa export ke Collector.
+- Setiap service menghasilkan trace dan bisa export ke Collector.
 - Setiap request antar service (via RestClient) punya satu trace yang utuh, tidak putus.
-- Log bisa dikorelasikan dengan trace lewat `traceId`/`spanId`.
-- Sampling head-based aktif sebagai baseline.
+- Tail-based sampling dengan `errors-policy` aktif — semua trace error pasti tersimpan.
+- Trace + stack trace error bisa diakses lewat web Jaeger (bagian 12).
+
+**Metrics dan log pipeline (Loki/Elastic) tidak dikerjakan di Phase 1** — metrics tetap ter-generate otomatis dari Actuator sebagai bonus, tapi belum dikonsumsi/dipakai. Log tetap ke console/file seperti biasa, belum dikirim ke backend observability terpisah.
 
 ## Phase 2 — Refinement
 
 ```text
-- Tail-based sampling di Collector
 - JDBC span (kalau dibutuhkan)
-- Database metrics (connection pool, query time)
+- Log pipeline (OTLP logs -> Loki/Elastic) untuk pencarian log lintas waktu
+- Grafana sebagai visualisasi terpadu (kalau nanti butuh "klik trace, lihat log")
 ```
 
 ## Phase 3 — Komponen di luar scope Phase 1
@@ -555,6 +586,62 @@ Incident investigation workflow
 
 Setelah Phase 1 disepakati dan diimplementasikan di satu service percobaan, evaluasi:
 
-1. Apakah trace antar service (via RestClient) benar-benar nyambung end-to-end (cek di Jaeger/Tempo).
-2. Apakah volume trace dari sampling `probability: 1.0` masih wajar untuk storage, atau perlu langsung pindah ke tail-based sampling.
-3. Baru lanjut rollout ke service lain, dan pertimbangkan Phase 3 sesuai prioritas.
+1. Apakah trace antar service (via RestClient) benar-benar nyambung end-to-end (cek di Jaeger).
+2. Apakah `errors-policy` di tail-based sampling benar-benar menangkap semua trace error (coba trigger error manual, cek muncul di Jaeger).
+3. Baru lanjut rollout ke service lain, dan pertimbangkan Phase 2/3 sesuai prioritas.
+
+---
+
+# 12. Akses Web Jaeger untuk Melihat Trace
+
+## 12.1 Deploy Jaeger
+
+Untuk kebutuhan Phase 1, `jaegertracing/all-in-one` sudah cukup (menggabungkan collector, storage in-memory/badger, dan UI dalam satu image) — tidak perlu setup storage backend terpisah (Cassandra/Elasticsearch) di tahap awal:
+
+```yaml
+# docker-compose (dev/lokal)
+jaeger:
+  image: jaegertracing/all-in-one:latest
+  environment:
+    COLLECTOR_OTLP_ENABLED: "true"
+  ports:
+    - "16686:16686"   # Jaeger UI
+```
+
+Untuk OpenShift/Kubernetes, deploy sebagai `Deployment` + `Service` biasa (port `16686` untuk UI, `4317`/`4318` untuk terima OTLP dari Collector).
+
+## 12.2 Cara mengakses web UI-nya
+
+**Lokal / docker-compose:**
+Langsung buka `http://localhost:16686` di browser — tidak perlu langkah tambahan.
+
+**Di OpenShift (sesuai arsitektur Anda):**
+Opsi paling umum, pakai `Route` supaya bisa diakses lewat browser tanpa VPN/port-forward setiap saat:
+
+```bash
+oc expose service jaeger --port=16686 --name=jaeger-ui
+oc get route jaeger-ui   # dapatkan URL publik/internal-nya
+```
+
+Kalau cuma butuh akses sementara untuk development (belum mau expose permanen), pakai port-forward:
+
+```bash
+oc port-forward svc/jaeger 16686:16686
+# lalu buka http://localhost:16686
+```
+
+**Catatan keamanan:** kalau di-expose lewat `Route`, pertimbangkan apakah perlu dibatasi akses-nya (misal lewat network policy, atau taruh di belakang Kong/gateway internal juga) — Jaeger UI default tidak punya autentikasi bawaan.
+
+## 12.3 Cara mencari trace yang error
+
+Di halaman utama Jaeger UI:
+
+1. Pilih **Service** yang mau dicek dari dropdown (nama-nama ini datang dari `spring.application.name` tiap service, bagian 7.1).
+2. Di kolom **Tags**, isi `error=true` — ini akan filter dan tampilkan hanya trace yang mengandung span berstatus error.
+3. Klik salah satu trace dari hasil pencarian → akan terbuka detail trace dengan span-span-nya. Span yang error ditandai warna merah.
+4. Klik span yang error tersebut → expand bagian **Logs** di detail span → di situ muncul `exception.type`, `exception.message`, dan `exception.stacktrace` lengkap (hasil dari mekanisme otomatis di bagian 7.5).
+
+Kalau sudah tahu `traceId` spesifik (misal dari korelasi manual atau catatan incident), bisa langsung akses lewat URL:
+```text
+http://<jaeger-host>/trace/<traceId>
+```
