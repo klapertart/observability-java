@@ -358,8 +358,7 @@ management:
 logging:
   level:
     root: INFO
-  pattern:
-    level: "%5p [${spring.application.name},%X{traceId:-},%X{spanId:-}]"
+  # traceId dan spanId otomatis muncul di log (Spring Boot 3.2+), tidak perlu logging.pattern.level
 ```
 
 **`application.properties`** (setara dengan `application.yml` di atas, pilih salah satu format saja, jangan dua-duanya di service yang sama):
@@ -374,12 +373,12 @@ management.tracing.sampling.probability=1.0
 management.otlp.tracing.endpoint=http://otel-collector:4318/v1/traces
 management.otlp.metrics.export.url=http://otel-collector:4318/v1/metrics
 
-# log: level INFO, traceId dan spanId ikut di setiap baris log
+# log: level INFO. traceId dan spanId otomatis muncul di log (Spring Boot 3.2+),
+# tidak perlu logging.pattern.level
 logging.level.root=INFO
-logging.pattern.level=%5p [${spring.application.name},%X{traceId:-},%X{spanId:-}]
 ```
 
-> Catatan: nama property OTLP di atas (`management.otlp.tracing.endpoint`) mengikuti Spring Boot 3.x umum. Beberapa versi lebih baru memakai `management.opentelemetry.tracing.export.otlp.endpoint` — sesuaikan dengan versi Spring Boot yang dipakai. Berlaku sama untuk format `.yml` maupun `.properties`; contoh varian barunya di `.properties`:
+> Catatan versi: `management.otlp.tracing.endpoint` berlaku untuk Spring Boot 3.x. Di Spring Boot 4.x namanya `management.opentelemetry.tracing.export.otlp.endpoint`, dan dependency-nya cukup satu `spring-boot-starter-opentelemetry` (isinya bridge + exporter OTLP, konsepnya tetap Opsi 2). Di Spring Boot 3.x, export metrics via OTLP juga butuh dependency `io.micrometer:micrometer-registry-otlp`; tanpa itu property `management.otlp.metrics.export.url` diabaikan. Kalau nama property salah, exporter tidak jalan dan biasanya tanpa error yang jelas. Berlaku sama untuk format `.yml` maupun `.properties`; contoh varian Boot 4 di `.properties`:
 >
 > ```properties
 > management.opentelemetry.tracing.export.otlp.endpoint=http://otel-collector:4318/v1/traces
