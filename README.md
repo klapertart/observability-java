@@ -254,16 +254,17 @@ Scope tahap awal: beberapa Spring Boot microservice yang saling memanggil lewat 
               Traces                   Metrics                    Logs
                   |                        |                        |
                   v                        v                        v
-          Jaeger / Tempo             Prometheus              Loki / Elastic
-                  |                        |                        |
-                  +------------------------+------------------------+
-                                           |
-                                      Grafana (visualisasi)
+              Jaeger                  Prometheus              Loki / Elastic
+                  |
+                  v
+              OpenSearch
+          (storage backend,
+             production)
 ```
 
 Aplikasi mengirim OTLP (traces, metrics, logs) ke OTel Collector, Collector meneruskan ke backend masing-masing.
 
-> **Fokus Phase 1:** jalur **Traces → Jaeger** saja yang aktif dipakai. Jalur Metrics → Prometheus tetap jalan otomatis (tidak perlu setup tambahan) tapi belum dipakai. Jalur Logs → Loki/Elastic **belum diaktifkan** — lihat bagian "Tujuan" dan bagian 10.
+> **Fokus Phase 1:** jalur **Traces → Jaeger → OpenSearch** yang aktif dipakai (storage backend production, lihat bagian 12). Jalur Metrics → Prometheus tetap jalan otomatis (tidak perlu setup tambahan) tapi belum dipakai. Jalur Logs → Loki/Elastic **belum diaktifkan** — lihat bagian "Tujuan" dan bagian 10.
 
 ## 5.2 Flow request antar service
 
@@ -300,7 +301,7 @@ Ada tiga pilihan cara instrumentasi Spring Boot dengan OTel:
 | Opsi | Cara Kerja | Config | JDBC span otomatis? |
 |---|---|---|---|
 | 1. Java Agent | `-javaagent`, zero-code | env var (`OTEL_*`) | Ya |
-| **2. Micrometer Tracing + OTel bridge (dipilih)** | Dependency + Observation API | `application.yml` (`management.*`) | Tidak, perlu tambahan |
+| **2. Micrometer Tracing + OTel bridge (dipilih)** | Dependency + Observation API | `application.yml` atau `application.properties` (`management.*`) | Tidak, perlu tambahan |
 | 3. OTel Spring Boot Starter murni | Dependency, OTel API langsung | `application.properties` (`otel.*`) | Tidak, perlu tambahan |
 
 **Keputusan: Opsi 2 (Micrometer Tracing + OTel bridge).**
@@ -361,7 +362,29 @@ logging:
     level: "%5p [${spring.application.name},%X{traceId:-},%X{spanId:-}]"
 ```
 
-> Catatan: nama property OTLP di atas (`management.otlp.tracing.endpoint`) mengikuti Spring Boot 3.x umum. Beberapa versi lebih baru memakai `management.opentelemetry.tracing.export.otlp.endpoint` — sesuaikan dengan versi Spring Boot yang dipakai.
+**`application.properties`** (setara dengan `application.yml` di atas, pilih salah satu format saja, jangan dua-duanya di service yang sama):
+
+```properties
+spring.application.name=order-service
+
+# head-based sampling di sisi aplikasi, lihat bagian 8
+management.tracing.sampling.probability=1.0
+
+# export trace dan metrics ke OTel Collector via OTLP/HTTP
+management.otlp.tracing.endpoint=http://otel-collector:4318/v1/traces
+management.otlp.metrics.export.url=http://otel-collector:4318/v1/metrics
+
+# log: level INFO, traceId dan spanId ikut di setiap baris log
+logging.level.root=INFO
+logging.pattern.level=%5p [${spring.application.name},%X{traceId:-},%X{spanId:-}]
+```
+
+> Catatan: nama property OTLP di atas (`management.otlp.tracing.endpoint`) mengikuti Spring Boot 3.x umum. Beberapa versi lebih baru memakai `management.opentelemetry.tracing.export.otlp.endpoint` — sesuaikan dengan versi Spring Boot yang dipakai. Berlaku sama untuk format `.yml` maupun `.properties`; contoh varian barunya di `.properties`:
+>
+> ```properties
+> management.opentelemetry.tracing.export.otlp.endpoint=http://otel-collector:4318/v1/traces
+> management.opentelemetry.resource-attributes.service.name=order-service
+> ```
 
 ## 7.2 Propagation antar service (RestClient)
 
@@ -463,6 +486,12 @@ management:
   tracing:
     sampling:
       probability: 1.0   # untuk sementara: trace semua request dulu, lihat bagian 8.2
+```
+
+Versi `application.properties`:
+
+```properties
+management.tracing.sampling.probability=1.0
 ```
 
 Dipakai untuk sementara dengan `probability: 1.0` (semua di-trace) selama volume trafik masih kecil dan tail-based sampling di Collector belum aktif — supaya tidak ada trace error yang terlewat sejak awal.
@@ -596,19 +625,41 @@ Setelah Phase 1 disepakati dan diimplementasikan di satu service percobaan, eval
 
 ## 12.1 Deploy Jaeger
 
-Untuk kebutuhan Phase 1, `jaegertracing/all-in-one` sudah cukup (menggabungkan collector, storage in-memory/badger, dan UI dalam satu image) — tidak perlu setup storage backend terpisah (Cassandra/Elasticsearch) di tahap awal:
+**Keputusan storage: OpenSearch** (bukan in-memory) — karena target akhirnya production, trace harus tetap ada meski Jaeger/pod di-restart.
+
+Jaeger secara resmi mendukung OpenSearch sebagai storage backend sejak versi **1.53** — pastikan image Jaeger yang dipakai di atas versi itu. Reuse cluster OpenSearch yang sudah ada di infrastruktur kalau memang sudah tersedia; kalau belum, perlu disediakan terpisah.
+
+**Dev/lokal (opsional, in-memory) — untuk uji coba cepat sebelum ke OpenSearch:**
 
 ```yaml
 # docker-compose (dev/lokal)
 jaeger:
-  image: jaegertracing/all-in-one:latest
+  image: jaegertracing/all-in-one:1.60
   environment:
     COLLECTOR_OTLP_ENABLED: "true"
   ports:
     - "16686:16686"   # Jaeger UI
 ```
 
-Untuk OpenShift/Kubernetes, deploy sebagai `Deployment` + `Service` biasa (port `16686` untuk UI, `4317`/`4318` untuk terima OTLP dari Collector).
+**Production — dengan OpenSearch:**
+
+```yaml
+jaeger:
+  image: jaegertracing/all-in-one:1.60
+  environment:
+    COLLECTOR_OTLP_ENABLED: "true"
+    SPAN_STORAGE_TYPE: opensearch
+    ES_SERVER_URLS: http://opensearch:9200
+    ES_TLS_ENABLED: "true"          # sesuaikan kalau OpenSearch-nya pakai TLS
+    ES_USERNAME: ${OPENSEARCH_USERNAME}
+    ES_PASSWORD: ${OPENSEARCH_PASSWORD}
+  ports:
+    - "16686:16686"
+```
+
+Untuk OpenShift/Kubernetes, deploy `jaeger-collector` dan `jaeger-query` (UI) sebagai `Deployment` + `Service` terpisah (bukan `all-in-one`) supaya masing-masing bisa di-scale independen — keduanya diarahkan ke OpenSearch yang sama lewat env var yang sama seperti di atas. `jaeger-collector` menerima OTLP dari OTel Collector (port `4317`/`4318`), `jaeger-query` yang serve UI (port `16686`).
+
+**Retensi data:** OpenSearch tidak punya TTL native seperti Cassandra — retensi diatur lewat index lifecycle policy (rollover + delete index lama). Ini perlu disiapkan supaya index trace tidak tumbuh tanpa batas — misal, simpan trace 14–30 hari lalu index lama dihapus otomatis. Detail policy ini di luar scope dokumen ini, tapi perlu ditandai sebagai task terpisah sebelum go-live.
 
 ## 12.2 Cara mengakses web UI-nya
 
